@@ -215,17 +215,6 @@ ssh root@<device-ip> "iptables -t nat -D OUTPUT -p tcp --dport 80  -j DNAT --to-
 
 ---
 
-## Tested On
-
-| App | Platform | Flutter Version | Engine Hash | Status |
-|---|---|---|---|---|
-| IBS iLogistics | Android | 3.32.5 | dd93de6fb1 | ✅ Working |
-| IBS iFlight OPS | Android | 3.32.x | 1527ae0ec5 | ✅ Working |
-
-> Tested as part of authorized mobile penetration testing engagements.
-
----
-
 ## How It Works — Technical Deep Dive
 
 Flutter's `libflutter.so` / `Flutter.framework` is a fully stripped binary —
