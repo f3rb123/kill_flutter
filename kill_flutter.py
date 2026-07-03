@@ -8,33 +8,60 @@ import struct, re, sys, os, zipfile, subprocess, argparse
 
 
 # ─────────────────────────────────────────────
+#  BOX HELPERS (keeps all boxes perfectly aligned)
+# ─────────────────────────────────────────────
+
+BOX_WIDTH = 54  # visible characters between the ║ borders
+
+C_CYAN   = "\033[96m"
+C_YELLOW = "\033[93m"
+C_GREEN  = "\033[92m"
+C_RED    = "\033[91m"
+C_GREY   = "\033[90m"
+C_PURPLE = "\033[95m"
+C_RESET  = "\033[0m"
+
+
+def box_top():
+    return C_CYAN + "╔" + "═" * BOX_WIDTH + "╗" + C_RESET
+
+
+def box_bottom():
+    return C_CYAN + "╚" + "═" * BOX_WIDTH + "╝" + C_RESET
+
+
+def box_line(text, color=""):
+    """text is the raw visible text (no ANSI). Pads to BOX_WIDTH and adds borders."""
+    padded = text.ljust(BOX_WIDTH)
+    return f"{C_CYAN}║{C_RESET}{color}{padded}{C_RESET}{C_CYAN}║{C_RESET}"
+
+
+# ─────────────────────────────────────────────
 #  BANNER & HELP
 # ─────────────────────────────────────────────
 
 def print_banner():
-    print("""
-\033[36m
+    print(C_CYAN + """
 ██╗  ██╗██╗██╗     ██╗     
 ██║ ██╔╝██║██║     ██║     
 █████╔╝ ██║██║     ██║     
 ██╔═██╗ ██║██║     ██║     
 ██║  ██╗██║███████╗███████╗
-╚═╝  ╚═╝╚═╝╚══════╝╚══════╝
-\033[35m
+╚═╝  ╚═╝╚═╝╚══════╝╚══════╝""" + C_PURPLE + """
 ███████╗██╗     ██╗   ██╗████████╗████████╗███████╗██████╗ 
 ██╔════╝██║     ██║   ██║╚══██╔══╝╚══██╔══╝██╔════╝██╔══██╗
 █████╗  ██║     ██║   ██║   ██║      ██║   █████╗  ██████╔╝
 ██╔══╝  ██║     ██║   ██║   ██║      ██║   ██╔══╝  ██╔══██╗
 ██║     ███████╗╚██████╔╝   ██║      ██║   ███████╗██║  ██║
-╚═╝     ╚══════╝ ╚═════╝    ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝
-\033[0m
-\033[96m  ╔══════════════════════════════════════════════════════╗
-  ║   \033[93mK!ll Fl!utter  \033[91m—  Flutter SSL Pinning Bypass      \033[96m║
-  ║   \033[92mBy: f3rb                            \033[90mv2.0.0        \033[96m║
-  ║   \033[95mAndroid (APK) + iOS (IPA) Support               \033[96m║
-  ║   \033[95mFor authorized penetration testing only          \033[96m║
-  ╚══════════════════════════════════════════════════════╝\033[0m
-""")
+╚═╝     ╚══════╝ ╚═════╝    ╚═╝      ╚═╝   ╚══════╝╚═╝  ╚═╝""" + C_RESET)
+
+    print(box_top())
+    print(box_line("  K!ll Fl!utter  —  Flutter SSL Pinning Bypass", C_YELLOW))
+    print(box_line("  By: f3rb                              v2.0.0", C_GREEN))
+    print(box_line("  Android (APK) + iOS (IPA) Support", C_PURPLE))
+    print(box_line("  For authorized penetration testing only", C_PURPLE))
+    print(box_bottom())
+    print("")
 
 
 def print_help():
@@ -220,23 +247,22 @@ def parse_elf_segments(data):
 # ─────────────────────────────────────────────
 
 def parse_macho_segments(data):
-    """Returns (code_foff, code_vaddr, code_filesz) for __TEXT executable segment."""
+    """Returns (code_foff, code_vaddr, code_filesz, data) for __TEXT executable segment.
+    Always returns a 4-tuple; data may be a sliced arm64 view of a fat binary."""
 
     MH_MAGIC_64    = 0xFEEDFACF  # 64-bit little-endian
     FAT_MAGIC      = 0xCAFEBABE  # Fat binary (big-endian)
     LC_SEGMENT_64  = 0x19
-    CPU_TYPE_ARM64 = 0x0100000C  # in big-endian fat arch
 
     magic = struct.unpack_from('<I', data, 0)[0]
 
     # Handle fat binary — extract arm64 slice
-    if magic == struct.unpack('>I', struct.pack('<I', FAT_MAGIC))[0] or \
-       struct.unpack_from('>I', data, 0)[0] == FAT_MAGIC:
+    if struct.unpack_from('>I', data, 0)[0] == FAT_MAGIC:
         print(f"\033[96m[*]\033[0m Detected fat binary — extracting arm64 slice")
         nfat = struct.unpack_from('>I', data, 4)[0]
         for i in range(nfat):
             off = 8 + i * 20
-            cputype = struct.unpack_from('>I', data, off)[0]
+            cputype      = struct.unpack_from('>I', data, off)[0]
             slice_offset = struct.unpack_from('>I', data, off + 8)[0]
             slice_size   = struct.unpack_from('>I', data, off + 12)[0]
             # ARM64 cputype = 0x0100000C
@@ -248,7 +274,7 @@ def parse_macho_segments(data):
 
     if magic != MH_MAGIC_64:
         print(f"\033[91m[-] Not a valid Mach-O 64-bit binary (magic={hex(magic)})\033[0m")
-        return None, None, None
+        return None, None, None, data
 
     ncmds    = struct.unpack_from('<I', data, 16)[0]
     cmd_off  = 32  # sizeof mach_header_64
@@ -304,14 +330,13 @@ def find_offset(binary_path, platform):
     if platform == 'android':
         code_foff, code_vaddr, code_filesz = parse_elf_segments(data)
     else:
-        result = parse_macho_segments(data)
-        if len(result) == 4:
-            code_foff, code_vaddr, code_filesz, data = result
-            # Re-find strings in possibly-sliced data
-            ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
-            ssl_server  = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
-        else:
-            code_foff, code_vaddr, code_filesz = result[:3]
+        code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
+        # Re-find strings in possibly-sliced data
+        ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
+        ssl_server  = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
+        if not ssl_client or not ssl_server:
+            print("\033[91m[-] ssl_client/ssl_server strings not found in arm64 slice\033[0m")
+            return None
 
     if code_foff is None:
         print("\033[91m[-] No executable segment found\033[0m")
@@ -420,14 +445,14 @@ def print_commands_android(package, proxy, script_path):
     set_443   = f'adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {proxy}"'
     set_80    = f'adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 80  -j DNAT --to-destination {proxy}"'
     verify    = 'adb shell su -c "iptables -t nat -L OUTPUT --line-numbers"'
-    frida_cmd = f'frida -U -f {package} --no-pause -l "{script_path}"'
+    frida_cmd = f'frida -U -f {package} -l "{script_path}"'
     del_443   = f'adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination {proxy}"'
     del_80    = f'adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 80  -j DNAT --to-destination {proxy}"'
 
     print("")
-    print("\033[96m╔══════════════════════════════════════════════════════╗")
-    print("║          \033[93mANDROID — COPY PASTE COMMANDS\033[96m                ║")
-    print("╚══════════════════════════════════════════════════════╝\033[0m")
+    print(box_top())
+    print(box_line("          ANDROID — COPY PASTE COMMANDS", C_YELLOW))
+    print(box_bottom())
     print("")
     print("\033[93m[1] Set iptables on device:\033[0m")
     print("  " + set_443)
@@ -446,16 +471,16 @@ def print_commands_android(package, proxy, script_path):
 
 
 def print_commands_ios(package, proxy, script_path, device_ip):
-    frida_cmd = f'frida -U -f {package} --no-pause -l "{script_path}"'
+    frida_cmd = f'frida -U -f {package} -l "{script_path}"'
     set_443   = f'ssh root@{device_ip} "iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination {proxy}"'
     set_80    = f'ssh root@{device_ip} "iptables -t nat -A OUTPUT -p tcp --dport 80  -j DNAT --to-destination {proxy}"'
     del_443   = f'ssh root@{device_ip} "iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination {proxy}"'
     del_80    = f'ssh root@{device_ip} "iptables -t nat -D OUTPUT -p tcp --dport 80  -j DNAT --to-destination {proxy}"'
 
     print("")
-    print("\033[96m╔══════════════════════════════════════════════════════╗")
-    print("║            \033[93miOS — COPY PASTE COMMANDS\033[96m                  ║")
-    print("╚══════════════════════════════════════════════════════╝\033[0m")
+    print(box_top())
+    print(box_line("            iOS — COPY PASTE COMMANDS", C_YELLOW))
+    print(box_bottom())
     print("")
     print("\033[93m[1] Set WiFi proxy on device:\033[0m")
     print(f"  Settings → WiFi → Your Network → HTTP Proxy → Manual")
@@ -476,13 +501,13 @@ def print_commands_ios(package, proxy, script_path, device_ip):
 
 def print_summary(package, offset, script_path, proxy, platform):
     print("")
-    print("\033[96m╔══════════════════════════════════════════════════════╗")
-    print("\033[93m  Platform : \033[92m" + platform.upper())
-    print("\033[93m  Package  : \033[92m" + package)
-    print("\033[93m  Offset   : \033[92m" + hex(offset))
-    print("\033[93m  Script   : \033[92m" + os.path.basename(script_path))
-    print("\033[93m  Proxy    : \033[92m" + proxy)
-    print("\033[96m╚══════════════════════════════════════════════════════╝\033[0m")
+    print(box_top())
+    print(box_line(f"  Platform : {platform.upper()}", C_GREEN))
+    print(box_line(f"  Package  : {package}", C_GREEN))
+    print(box_line(f"  Offset   : {hex(offset)}", C_GREEN))
+    print(box_line(f"  Script   : {os.path.basename(script_path)}", C_GREEN))
+    print(box_line(f"  Proxy    : {proxy}", C_GREEN))
+    print(box_bottom())
     print("")
 
 
