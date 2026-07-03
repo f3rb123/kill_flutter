@@ -1,6 +1,6 @@
 # K!ll Fl!utter 🔪
 
-![K!ll Fl!utter](flutter.jpg)
+![K!ll Fl!utter](flutter-v2.png)
 
 > **Flutter SSL Pinning Bypass Tool — Android & iOS**  
 > By [f3rb](https://github.com/f3rb)  
