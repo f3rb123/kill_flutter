@@ -2,97 +2,93 @@
 
 ![K!ll Fl!utter](flutter-v2.png)
 
-> **Flutter SSL Pinning Bypass Tool — Android & iOS**  
-> By [f3rb](https://github.com/f3rb)  
+> **Flutter SSL Pinning Bypass — Android & iOS**
+> By [f3rb](https://github.com/f3rb)
 > For authorized penetration testing only
 
 ---
 
-## The Problem
+## The Story
 
-Flutter apps are notoriously difficult to intercept during penetration testing.
-Unlike standard Android or iOS apps, Flutter bundles its own network stack —
-**BoringSSL** — compiled directly into a native binary (`libflutter.so` on
-Android, `Flutter.framework/Flutter` on iOS).
-
-This means:
-
-- ❌ Android Network Security Config is completely ignored
-- ❌ Java-level SSL hooks (OkHttp, HttpURLConnection) don't exist
-- ❌ iOS App Transport Security is bypassed
-- ❌ System proxy settings are not respected
-- ❌ Standard tools like Objection, SSL Kill Switch, and generic Frida scripts hook the wrong layer entirely
-
-Even **reFlutter** — the most popular Flutter-specific bypass tool — relies on
-a hardcoded database of known Flutter engine hashes. Any app built on a Flutter
-version not in that database simply won't be patched correctly.
+A few months back, on a routine Flutter app pentest, the usual SSL pinning bypasses all failed — the common Frida scripts and reFlutter, nothing got traffic into Burp. That sent me down a rabbit hole into *why* Flutter is so resistant to interception, and this tool is the result.
 
 ---
 
-## The Solution
+## Why Flutter Is Different
 
-K!ll Fl!utter takes a fundamentally different approach. Instead of relying on
-known patterns or version databases, it **derives the exact hook offset directly
-from the binary itself** using three version-agnostic techniques:
+Flutter doesn't use the phone's normal network stack. It ships its own networking engine (BoringSSL) compiled into a native file — `libflutter.so` on Android, the `Flutter` framework on iOS. All certificate checking happens inside that compiled file.
 
-### 1. String Anchors
-Regardless of Flutter version or compiler, BoringSSL's SSL verification function
-always references two strings: `ssl_client` and `ssl_server`. This is hardcoded
-in BoringSSL's open source and will never change. These strings act as permanent
-landmarks inside any Flutter binary.
+That's also why OS-level bypasses like **Objection** and **SSL Kill Switch** don't help — they hook the system trust APIs, which Flutter never calls. It goes straight to BoringSSL inside its own engine.
 
-### 2. ADRP+ADD Instruction Scan
-ARM64 always loads string addresses using `ADRP+ADD` instruction pairs — this is
-an architecture-level constant, not a Flutter-specific pattern. By scanning the
-executable segment for these instruction pairs pointing to our landmark strings,
-we precisely locate the function body in any binary regardless of version.
+So on Flutter you're left with two real options — and on modern builds, both were failing.
 
-### 3. Prologue Walkback
-ARM64 functions always begin with a stack setup instruction (`STP x29,x30` or
-`SUB sp`) — an ABI requirement that never changes. Walking backwards from the
-landmark hits the exact function start, giving us the offset to hook.
+---
 
-Once the offset is found, a Frida script is generated that intercepts
-`ssl_crypto_x509_session_verify_cert_chain` at runtime, forcing it to always
-return success — making the app trust any certificate including Burp's.
+## Why the Usual Tools Fail
 
-Since Flutter ignores system proxy settings, **iptables DNAT rules** are used
-to transparently redirect all TCP 443/80 traffic to Burp at the kernel level,
-bypassing Flutter's direct connection behavior entirely.
+### Public Frida scripts
+These hook the certificate-check function at a **hardcoded offset**, worked out by reverse-engineering one specific version of the Flutter engine. The problem: that offset is different in every build. Flutter releases constantly, and each engine version compiles differently, so the function moves to a new address each time. A script written for an older version points at the wrong location, matches nothing, and the hook never lands. The script didn't break — the binary moved under it.
+
+### reFlutter
+For a long time this was the go-to Flutter tool, and it genuinely worked. It reads a snapshot hash from the app, matches it against a table of known Flutter engine versions, then recompiles a patched engine to swap in. But that table has to be manually updated for each Flutter release and has fallen behind — on newer builds the hash isn't recognised and it reports the engine as unsupported.
+
+### The common thread
+Both tools are pinned to a specific Flutter version — one through a hardcoded offset, the other through a lookup table. Flutter ships faster than either keeps up, so both decay over time and fail on current apps.
+
+---
+
+## The Deeper Problem
+
+The engine binary is stripped — no function names, no labels. Finding the certificate-check function the manual way means hours in Ghidra or IDA, and because the offset changes every version, you'd have to redo it for every new build.
+
+---
+
+## How K!ll Fl!utter Works Differently
+
+Instead of a hardcoded offset or a version table, it finds the function **fresh in each binary** using properties that stay constant across every Flutter version:
+
+1. **String anchors** — BoringSSL's verification function always references two fixed strings, `ssl_client` and `ssl_server`. These are baked into BoringSSL's own source and exist in every Flutter binary ever compiled.
+
+2. **ADRP+ADD instruction scan** — ARM64 always loads string addresses using `ADRP+ADD` instruction pairs. This is an architecture-level constant, not a Flutter-specific pattern. Scanning for these pairs pointing at the anchor strings locates the function body.
+
+3. **Prologue walkback** — ARM64 functions always begin with a stack-setup instruction (`STP x29,x30` or `SUB sp`). Walking backward from the anchors to that instruction gives the exact function start.
+
+From these it calculates the exact **offset** of the certificate-check function in that specific binary. Because it recalculates the offset every time, the Frida hook lands precisely on any build — **no manual reverse engineering, no Ghidra, no version table, nothing to keep updating.**
 
 ```
-APK/IPA
-  └── Extract Flutter binary (libflutter.so / Flutter.framework)
+APK / IPA
+  └── Extract Flutter engine binary (libflutter.so / Flutter framework)
        └── Find ssl_client + ssl_server string anchors
-            └── Scan ADRP+ADD instruction pairs in executable segment
+            └── Scan ADRP+ADD instruction pairs referencing both
                  └── Walk back to ARM64 function prologue
-                      └── Offset found → Frida script generated
-                           └── iptables DNAT → all traffic hits Burp ✓
+                      └── Offset calculated → Frida script generated
+                           └── iptables redirect → traffic hits Burp
 ```
 
 ---
 
-## Why Other Tools Fail
+## The Flow
 
-| Tool | Approach | Why It Fails |
-|---|---|---|
-| Objection / SSL Kill Switch | Hooks Java/ObjC SSL layer | Flutter doesn't use this layer |
-| Generic Frida scripts | Hardcoded byte patterns | Patterns change with every Flutter version |
-| reFlutter | Patches APK from hash database | Database doesn't cover new Flutter versions |
-| **K!ll Fl!utter** | **Dynamic binary analysis** | **Works on any Flutter version** |
+1. Point it at an APK or IPA
+2. It extracts the Flutter engine file
+3. It finds the certificate-check function and calculates its offset
+4. It generates a ready-to-use Frida script that forces the check to pass
+5. It prints the exact commands to route traffic to your proxy (Flutter ignores proxy settings, so it uses kernel-level redirection)
+
+Point it at an app, get back a working Frida script and copy-paste commands.
 
 ---
 
-## What Pinning Does It Bypass?
+## What Pinning It Bypasses
 
-✅ Default Flutter `HttpClient` (dart:io) certificate validation  
-✅ `dio` package SSL pinning  
-✅ Custom certificate validators built on Flutter's HTTP stack  
-✅ Any pinning that ultimately calls `ssl_crypto_x509_session_verify_cert_chain`  
+✅ Default Flutter `HttpClient` (dart:io) certificate validation
+✅ `dio` package SSL pinning
+✅ Custom certificate validators built on Flutter's HTTP stack
+✅ Any pinning that ultimately calls `ssl_crypto_x509_session_verify_cert_chain`
 
-❌ mTLS / client certificate pinning (server requires a client cert)  
-❌ Native Android/iOS certificate pinning outside Flutter  
-❌ Root / jailbreak detection (separate problem)  
+❌ mTLS / client certificate pinning (server requires a client cert)
+❌ Native Android/iOS certificate pinning outside Flutter
+❌ Root / jailbreak detection (separate problem)
 
 ---
 
@@ -151,38 +147,29 @@ python3 kill_flutter.py app.apk --platform android -i 192.168.1.10
 | `--device-ip` | iOS device IP for SSH iptables | `<DEVICE_IP>` |
 | `-h, --help` | Show help | — |
 
+> **Note:** the tool handles one platform per run, auto-detected from the file extension (`.apk` → Android, `.ipa` → iOS). For the same app on both platforms, run it twice — once per binary.
+
 ---
 
 ## Output
 
 The tool generates everything needed in one run:
 
-- `flutter_bypass.js` — Ready-to-use Frida script with offset baked in
+- `flutter_bypass.js` — ready-to-use Frida script with the offset baked in
 - Copy-paste iptables commands (Android via adb / iOS via SSH)
-- Copy-paste Frida launch command with package name auto-filled
+- Copy-paste Frida launch command with the package name auto-filled
 
 ```
 [*] Platform : ANDROID
 [+] Package  : com.example.flutterapp
-[+] ssl_client @ ['0x1bb68a']
-[+] ssl_server @ ['0x1c4cb0']
+[+] ssl_client @ ['0x1a1d75']
+[+] ssl_server @ ['0x1ab471']
 [*] Scanning ADRP+ADD refs... (may take a moment)
-[+] SSL verify offset: 0x73ee8c
+[+] SSL verify offset: 0x740cc8
 [+] Frida script saved: /path/to/flutter_bypass.js
-
-[1] Set iptables on device:
-  adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination 192.168.1.10:8080"
-  adb shell su -c "iptables -t nat -A OUTPUT -p tcp --dport 80  -j DNAT --to-destination 192.168.1.10:8080"
-
-[2] Verify iptables rules:
-  adb shell su -c "iptables -t nat -L OUTPUT --line-numbers"
 
 [3] Launch Frida:
   frida -U -f com.example.flutterapp -l "/path/to/flutter_bypass.js"
-
-[4] Revert iptables when done:
-  adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination 192.168.1.10:8080"
-  adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 80  -j DNAT --to-destination 192.168.1.10:8080"
 ```
 
 ---
@@ -215,58 +202,41 @@ ssh root@<device-ip> "iptables -t nat -D OUTPUT -p tcp --dport 80  -j DNAT --to-
 
 ---
 
-## How It Works — Technical Deep Dive
+## How It Finds the Function — Technical Detail
 
-Flutter's `libflutter.so` / `Flutter.framework` is a fully stripped binary —
-no symbols, no debug info. The SSL verification function
-`ssl_crypto_x509_session_verify_cert_chain` cannot be found by name.
+Flutter's engine binary is fully stripped. The function `ssl_crypto_x509_session_verify_cert_chain` cannot be found by name, so it's located by behaviour instead:
 
-**Step 1 — String anchors:**  
-BoringSSL source always has:
+**String anchors** — BoringSSL source contains:
 ```c
 const char *peer = SSL_is_server(ssl) ? "ssl_client" : "ssl_server";
 ```
-These strings exist in every Flutter binary ever compiled. We find their
-file offsets using a simple byte scan.
+These strings are unique to this function and present in every build. A byte scan finds their file offsets.
 
-**Step 2 — ELF/Mach-O segment parsing:**  
-ARM64 instructions encode virtual addresses, not file offsets. We parse
-the binary's segment headers to build a file-offset ↔ virtual-address
-mapping so our instruction scan produces correct results.
+**Segment parsing** — ARM64 instructions encode virtual addresses, not file offsets. The tool parses the ELF (Android) or Mach-O (iOS) segment headers to build a file-offset ↔ virtual-address mapping so the instruction scan is correct.
 
-**Step 3 — ADRP+ADD scan:**  
-We scan the executable segment for `ADD` instructions whose immediate
-value matches the low 12 bits of our string virtual addresses, then verify
-the preceding `ADRP` instruction targets the correct 4KB page. This gives
-us the exact code locations that load both strings.
+**ADRP+ADD scan** — it scans the executable segment for `ADD` instructions whose immediate matches the low 12 bits of each string's virtual address, then verifies the preceding `ADRP` targets the correct 4 KB page. This locates the code that loads both strings.
 
-**Step 4 — Prologue walkback:**  
-We walk backwards from the co-located string references until we hit a
-function prologue instruction (`STP x29,x30` or `SUB sp`). This is the
-first instruction of `ssl_crypto_x509_session_verify_cert_chain` —
-the offset we bake into the Frida script.
+**Prologue walkback** — from the co-located references, it walks backward to the first function-prologue instruction. That's the start of the verify function — the offset baked into the Frida script.
 
-**Step 5 — Frida hook:**
+**The hook** — at runtime, ASLR randomizes the library base, but the offset is fixed. `module.base + offset` always resolves to the function:
 ```javascript
-var addr = m.base.add(offset);  // ASLR base + fixed offset
+var addr = m.base.add(offset);
 Interceptor.attach(addr, {
     onLeave: function(retval) {
-        retval.replace(0x1);    // always return success
+        retval.replace(0x1);   // force verification success
     }
 });
 ```
 
-**Step 6 — iptables redirect:**  
-Flutter opens TCP connections directly, ignoring system proxy.
-Kernel-level DNAT intercepts all outgoing 443/80 traffic and
-redirects to Burp regardless of what the app does.
+**Traffic redirect** — Flutter opens TCP connections directly, ignoring the system proxy, so kernel-level iptables DNAT redirects all outgoing 443/80 traffic to Burp regardless of the app's behaviour.
 
 ---
 
 ## References
 
+- [PT Swarm — Fork Bomb for Flutter (reFlutter internals)](https://swarm.ptsecurity.com/fork-bomb-for-flutter/)
+- [SensePost — Intercepting HTTPS in Flutter with Frida](https://sensepost.com/blog/2025/intercepting-https-communication-in-flutter-going-full-hardcore-mode-with-frida/)
 - [NVISO — Intercepting Flutter Traffic](https://blog.nviso.eu/2022/08/18/intercept-flutter-traffic-on-ios-and-android-http-https-dio-pinning/)
-- [MindedSecurity — Bypassing Certificate Pinning on Flutter](https://blog.mindedsecurity.com/2024/05/bypassing-certificate-pinning-on.html)
 - [reFlutter](https://github.com/ptswarm/reFlutter)
 - [BoringSSL Source — ssl_x509.cc](https://github.com/google/boringssl/blob/master/ssl/ssl_x509.cc)
 
@@ -274,9 +244,7 @@ redirects to Burp regardless of what the app does.
 
 ## Disclaimer
 
-This tool is intended for **authorized security testing only**.  
-Only use on applications you have explicit written permission to test.  
-The author is not responsible for any misuse or damage caused by this tool.
+This tool is intended for **authorized security testing only**. Only use it on applications you have explicit written permission to test. The author is not responsible for any misuse or damage caused by this tool.
 
 ---
 
