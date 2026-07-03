@@ -178,7 +178,7 @@ The tool generates everything needed in one run:
   adb shell su -c "iptables -t nat -L OUTPUT --line-numbers"
 
 [3] Launch Frida:
-  frida -U -f com.example.flutterapp --no-pause -l "/path/to/flutter_bypass.js"
+  frida -U -f com.example.flutterapp -l "/path/to/flutter_bypass.js"
 
 [4] Revert iptables when done:
   adb shell su -c "iptables -t nat -D OUTPUT -p tcp --dport 443 -j DNAT --to-destination 192.168.1.10:8080"
