@@ -1,4 +1,4 @@
-# K!ll Fl!utter 🔪
+# Kill Flutter 🔪
 
 ![K!ll Fl!utter](banner.png)
 
