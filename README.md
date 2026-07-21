@@ -77,6 +77,8 @@ APK / IPA
 
 Point it at an app, get back a working Frida script and copy-paste commands.
 
+![K!ll Fl!utter](flutter-v2.png)
+
 ---
 
 ## What Pinning It Bypasses
