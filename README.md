@@ -3,7 +3,7 @@
 ![K!ll Fl!utter](banner.png)
 
 > **Flutter SSL Pinning Bypass Tool — Android & iOS**  
-> By [f3rb](https://github.com/f3rb)  
+> By [f3rb123](https://github.com/f3rb123)  
 > Multi-arch: `arm64-v8a` · `x86_64` · `armeabi-v7a`  
 > For authorized penetration testing only
 
@@ -148,7 +148,7 @@ let the tool default to `arm64-v8a`).
 ## Installation
 
 ```bash
-git clone https://github.com/f3rb/kill_flutter
+git clone https://github.com/f3rb123/kill_flutter
 cd kill_flutter
 pip install frida-tools
 pip install capstone   # optional: only for x86_64 / armeabi-v7a targets
@@ -354,4 +354,4 @@ The author is not responsible for any misuse or damage caused by this tool.
 
 ## Author
 
-**f3rb** — Offensive Security | Mobile Pentesting | Tool Development
+**f3rb123** — Offensive Security | Mobile Pentesting | Tool Development
