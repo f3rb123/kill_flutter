@@ -6,6 +6,8 @@
 # For authorized penetration testing only
 
 import struct, re, sys, os, zipfile, subprocess, argparse, plistlib
+import bisect
+from collections import defaultdict
 
 
 # ─────────────────────────────────────────────
@@ -272,83 +274,69 @@ def extract_flutter_ios(ipa_path, out_dir):
 
 
 # ─────────────────────────────────────────────
-#  ELF SEGMENT PARSERS
+#  ELF / MACH-O SEGMENT PARSERS
+#  Each returns a dict describing the executable segment plus a list of
+#  (file_offset, vaddr, filesz) LOAD segments used for foff<->vaddr mapping.
 # ─────────────────────────────────────────────
 
 def parse_elf64_segments(data):
-    """ELF64 (arm64-v8a, x86_64).
-    Returns (base_vaddr, code_foff, code_vaddr, code_filesz)."""
     if data[:4] != b'\x7fELF':
-        return None, None, None, None
-
+        return None
     e_phoff     = struct.unpack_from('<Q', data, 0x20)[0]
     e_phentsize = struct.unpack_from('<H', data, 0x36)[0]
     e_phnum     = struct.unpack_from('<H', data, 0x38)[0]
 
-    base_vaddr = None
-    code_foff = code_vaddr = code_filesz = None
-
+    loads = []
+    code = None
+    eh_frame_hdr = None
     for i in range(e_phnum):
-        ph      = data[e_phoff + i*e_phentsize : e_phoff + (i+1)*e_phentsize]
-        p_type  = struct.unpack_from('<I', ph, 0x00)[0]
-        p_flags = struct.unpack_from('<I', ph, 0x04)[0]
-        p_offset = struct.unpack_from('<Q', ph, 0x08)[0]
-        p_vaddr  = struct.unpack_from('<Q', ph, 0x10)[0]
+        ph = e_phoff + i * e_phentsize
+        p_type   = struct.unpack_from('<I', data, ph + 0x00)[0]
+        p_flags  = struct.unpack_from('<I', data, ph + 0x04)[0]
+        p_offset = struct.unpack_from('<Q', data, ph + 0x08)[0]
+        p_vaddr  = struct.unpack_from('<Q', data, ph + 0x10)[0]
+        p_filesz = struct.unpack_from('<Q', data, ph + 0x20)[0]
+        if p_type == 1:  # PT_LOAD
+            loads.append((p_offset, p_vaddr, p_filesz))
+            if p_flags & 1 and code is None:  # PF_X
+                code = (p_offset, p_vaddr, p_filesz)
+                print(f"\033[92m[+]\033[0m ELF64 code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(p_filesz)}")
+        elif p_type == 0x6474e550:  # PT_GNU_EH_FRAME
+            eh_frame_hdr = (p_offset, p_vaddr, p_filesz)
 
-        # PT_LOAD
-        if p_type == 1:
-            if p_offset == 0 and base_vaddr is None:
-                base_vaddr = p_vaddr
-            # PF_X
-            if (p_flags & 1):
-                code_foff   = p_offset
-                code_vaddr  = p_vaddr
-                code_filesz = struct.unpack_from('<Q', ph, 0x20)[0]
-                print(f"\033[96m[*]\033[0m ELF64 code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
-
-    if base_vaddr is None:
-        base_vaddr = 0
-
-    return base_vaddr, code_foff, code_vaddr, code_filesz
+    if code is None:
+        return None
+    return {'loads': loads, 'code': code, 'eh_frame_hdr': eh_frame_hdr}
 
 
 def parse_elf32_segments(data):
-    """ELF32 (armeabi-v7a, x86).
-    Program header layout differs from ELF64 (p_flags is at +0x18).
-    Returns (base_vaddr, code_foff, code_vaddr, code_filesz)."""
     if data[:4] != b'\x7fELF':
-        return None, None, None, None
-
+        return None
     e_phoff     = struct.unpack_from('<I', data, 0x1C)[0]
     e_phentsize = struct.unpack_from('<H', data, 0x2A)[0]
     e_phnum     = struct.unpack_from('<H', data, 0x2C)[0]
 
-    base_vaddr = None
-    code_foff = code_vaddr = code_filesz = None
-
+    loads = []
+    code = None
+    arm_exidx = None
     for i in range(e_phnum):
-        ph       = data[e_phoff + i*e_phentsize : e_phoff + (i+1)*e_phentsize]
-        p_type   = struct.unpack_from('<I', ph, 0x00)[0]
-        p_offset = struct.unpack_from('<I', ph, 0x04)[0]
-        p_vaddr  = struct.unpack_from('<I', ph, 0x08)[0]
-        p_filesz = struct.unpack_from('<I', ph, 0x10)[0]
-        p_flags  = struct.unpack_from('<I', ph, 0x18)[0]   # ELF32: flags at +0x18
+        ph = e_phoff + i * e_phentsize
+        p_type   = struct.unpack_from('<I', data, ph + 0x00)[0]
+        p_offset = struct.unpack_from('<I', data, ph + 0x04)[0]
+        p_vaddr  = struct.unpack_from('<I', data, ph + 0x08)[0]
+        p_filesz = struct.unpack_from('<I', data, ph + 0x10)[0]
+        p_flags  = struct.unpack_from('<I', data, ph + 0x18)[0]
+        if p_type == 1:  # PT_LOAD
+            loads.append((p_offset, p_vaddr, p_filesz))
+            if p_flags & 1 and code is None:  # PF_X
+                code = (p_offset, p_vaddr, p_filesz)
+                print(f"\033[92m[+]\033[0m ELF32 code segment: file={hex(p_offset)} vaddr={hex(p_vaddr)} size={hex(p_filesz)}")
+        elif p_type == 0x70000001:  # PT_ARM_EXIDX
+            arm_exidx = (p_offset, p_vaddr, p_filesz)
 
-        # PT_LOAD
-        if p_type == 1:
-            if p_offset == 0 and base_vaddr is None:
-                base_vaddr = p_vaddr
-            # PF_X
-            if (p_flags & 1):
-                code_foff   = p_offset
-                code_vaddr  = p_vaddr
-                code_filesz = p_filesz
-                print(f"\033[96m[*]\033[0m ELF32 code segment: file={hex(code_foff)} vaddr={hex(code_vaddr)} size={hex(code_filesz)}")
-
-    if base_vaddr is None:
-        base_vaddr = 0
-
-    return base_vaddr, code_foff, code_vaddr, code_filesz
+    if code is None:
+        return None
+    return {'loads': loads, 'code': code, 'arm_exidx': arm_exidx}
 
 
 # ─────────────────────────────────────────────
@@ -356,16 +344,12 @@ def parse_elf32_segments(data):
 # ─────────────────────────────────────────────
 
 def parse_macho_segments(data):
-    """Returns (base_vaddr, code_foff, code_vaddr, code_filesz, data) for __TEXT executable segment.
-    Always returns a 5-tuple; data may be a sliced arm64 view of a fat binary."""
-
+    """Returns (segdict, data) where data may be a sliced arm64 view of a fat binary."""
     MH_MAGIC_64    = 0xFEEDFACF  # 64-bit little-endian
     FAT_MAGIC      = 0xCAFEBABE  # Fat binary (big-endian)
     LC_SEGMENT_64  = 0x19
 
     magic = struct.unpack_from('<I', data, 0)[0]
-
-    # Handle fat binary — extract arm64 slice
     if struct.unpack_from('>I', data, 0)[0] == FAT_MAGIC:
         print(f"\033[96m[*]\033[0m Detected fat binary — extracting arm64 slice")
         nfat = struct.unpack_from('>I', data, 4)[0]
@@ -374,8 +358,7 @@ def parse_macho_segments(data):
             cputype      = struct.unpack_from('>I', data, off)[0]
             slice_offset = struct.unpack_from('>I', data, off + 8)[0]
             slice_size   = struct.unpack_from('>I', data, off + 12)[0]
-            # ARM64 cputype = 0x0100000C
-            if cputype == 0x0100000C:
+            if cputype == 0x0100000C:  # ARM64
                 print(f"\033[92m[+]\033[0m arm64 slice found at offset {hex(slice_offset)}")
                 data = data[slice_offset:slice_offset + slice_size]
                 magic = struct.unpack_from('<I', data, 0)[0]
@@ -383,43 +366,119 @@ def parse_macho_segments(data):
 
     if magic != MH_MAGIC_64:
         print(f"\033[91m[-] Not a valid Mach-O 64-bit binary (magic={hex(magic)})\033[0m")
-        return None, None, None, None, data
+        return None, data
 
-    ncmds    = struct.unpack_from('<I', data, 16)[0]
-    cmd_off  = 32  # sizeof mach_header_64
+    ncmds   = struct.unpack_from('<I', data, 16)[0]
+    cmd_off = 32
 
-    base_vaddr = None
-    code_foff = code_vaddr = code_filesz = None
-
+    loads = []
+    code = None
     for _ in range(ncmds):
         cmd     = struct.unpack_from('<I', data, cmd_off)[0]
         cmdsize = struct.unpack_from('<I', data, cmd_off + 4)[0]
-
         if cmd == LC_SEGMENT_64:
-            # segname is 16 bytes at offset +8
-            segname  = data[cmd_off + 8 : cmd_off + 24].rstrip(b'\x00').decode('utf-8', errors='ignore')
+            segname  = data[cmd_off + 8: cmd_off + 24].rstrip(b'\x00').decode('utf-8', 'ignore')
             vmaddr   = struct.unpack_from('<Q', data, cmd_off + 24)[0]
-            vmsize   = struct.unpack_from('<Q', data, cmd_off + 32)[0]
             fileoff  = struct.unpack_from('<Q', data, cmd_off + 40)[0]
             filesize = struct.unpack_from('<Q', data, cmd_off + 48)[0]
             maxprot  = struct.unpack_from('<I', data, cmd_off + 56)[0]
-
-            if fileoff == 0 and base_vaddr is None:
-                base_vaddr = vmaddr
-
-            # __TEXT segment with execute permission (VM_PROT_EXECUTE = 4)
-            if segname == '__TEXT' and (maxprot & 4):
-                code_foff   = fileoff
-                code_vaddr  = vmaddr
-                code_filesz = filesize
-                print(f"\033[96m[*]\033[0m Mach-O __TEXT segment: file={hex(fileoff)} vaddr={hex(vmaddr)} size={hex(filesize)}")
-
+            loads.append((fileoff, vmaddr, filesize))
+            if segname == '__TEXT' and (maxprot & 4):  # VM_PROT_EXECUTE
+                code = (fileoff, vmaddr, filesize)
+                print(f"\033[92m[+]\033[0m Mach-O __TEXT segment: file={hex(fileoff)} vaddr={hex(vmaddr)} size={hex(filesize)}")
         cmd_off += cmdsize
 
-    if base_vaddr is None:
-        base_vaddr = 0
+    if code is None:
+        return None, data
+    # iOS builds don't ship .eh_frame_hdr; arm64 offset engine uses prologue fallback.
+    return {'loads': loads, 'code': code, 'eh_frame_hdr': None}, data
 
-    return base_vaddr, code_foff, code_vaddr, code_filesz, data  # return possibly-sliced data
+
+def foff_to_vaddr(loads, fo):
+    """Map a file offset to a virtual address using the LOAD segment table."""
+    for (off, va, sz) in loads:
+        if off <= fo < off + sz:
+            return va + (fo - off)
+    return fo  # last resort: assume identity
+
+
+# ─────────────────────────────────────────────
+#  UNWIND-TABLE FUNCTION-START TABLES  (exact boundaries)
+# ─────────────────────────────────────────────
+
+def eh_frame_function_starts(data, hdr_off, hdr_va):
+    """Parse .eh_frame_hdr's binary-search table -> sorted list of function-start VAs."""
+    p = hdr_off
+    version = data[p]
+    enc_fp  = data[p + 1]
+    enc_cnt = data[p + 2]
+    enc_tbl = data[p + 3]
+    p += 4
+    if version != 1:
+        return []
+
+    def dec(enc):
+        nonlocal p
+        fmt = enc & 0x0f
+        if fmt == 0x03:      # udata4
+            v = struct.unpack_from('<I', data, p)[0]; p += 4
+        elif fmt == 0x0b:    # sdata4
+            v = struct.unpack_from('<i', data, p)[0]; p += 4
+        elif fmt == 0x0c:    # udata8
+            v = struct.unpack_from('<Q', data, p)[0]; p += 8
+        else:
+            raise ValueError(f"eh_frame_hdr enc fmt {hex(fmt)} unsupported")
+        return v
+
+    dec(enc_fp)              # eh_frame_ptr (unused)
+    cnt = dec(enc_cnt)
+
+    appl = enc_tbl & 0x70
+    fmt  = enc_tbl & 0x0f
+    starts = []
+    for _ in range(cnt):
+        if fmt == 0x0b:
+            iloc = struct.unpack_from('<i', data, p)[0]; p += 4
+            struct.unpack_from('<i', data, p)[0];        p += 4  # fde ptr (skip)
+        elif fmt == 0x03:
+            iloc = struct.unpack_from('<I', data, p)[0]; p += 4
+            struct.unpack_from('<I', data, p)[0];        p += 4
+        else:
+            raise ValueError("eh_frame_hdr table fmt unsupported")
+        if appl == 0x30:     # datarel (relative to eh_frame_hdr start)
+            va = (hdr_va + iloc) & 0xffffffffffffffff
+        elif appl == 0x10:   # pcrel
+            va = (hdr_va + (p - 8 - hdr_off) + iloc) & 0xffffffffffffffff
+        else:
+            va = iloc & 0xffffffffffffffff
+        starts.append(va)
+    starts.sort()
+    return starts
+
+
+def arm_exidx_function_starts(data, exidx_off, exidx_va, exidx_sz, code_lo, code_hi):
+    """Parse .ARM.exidx (8-byte entries, prel31 fn ptr) -> sorted function-start VAs."""
+    def prel31(v):
+        v &= 0x7fffffff
+        if v & 0x40000000:
+            v -= 0x80000000
+        return v
+
+    starts = []
+    for e in range(exidx_off, exidx_off + exidx_sz, 8):
+        w0 = struct.unpack_from('<I', data, e)[0]
+        if w0 & 0x80000000:          # not a prel31 function pointer
+            continue
+        entry_va = (e - exidx_off) + exidx_va
+        fn = ((entry_va + prel31(w0)) & 0xffffffff) & ~1   # clear Thumb bit
+        if code_lo <= fn < code_hi:
+            starts.append(fn)
+    return sorted(set(starts))
+
+
+def func_start_before(starts, va):
+    idx = bisect.bisect_right(starts, va) - 1
+    return starts[idx] if idx >= 0 else None
 
 
 # ─────────────────────────────────────────────
@@ -439,14 +498,10 @@ def detect_binary_arch(data):
         return None
     ei_class = data[4]          # 1=ELF32, 2=ELF64
     e_machine = struct.unpack_from('<H', data, 0x12)[0]
-    if ei_class == 2 and e_machine == EM_AARCH64:
-        return 'arm64'
-    if ei_class == 2 and e_machine == EM_X86_64:
-        return 'x86_64'
-    if ei_class == 1 and e_machine == EM_ARM:
-        return 'arm'
-    if ei_class == 1 and e_machine == EM_386:
-        return 'x86'
+    if ei_class == 2 and e_machine == EM_AARCH64: return 'arm64'
+    if ei_class == 2 and e_machine == EM_X86_64:  return 'x86_64'
+    if ei_class == 1 and e_machine == EM_ARM:     return 'arm'
+    if ei_class == 1 and e_machine == EM_386:     return 'x86'
     return None
 
 
@@ -461,16 +516,72 @@ def _load_capstone():
 
 
 # ─────────────────────────────────────────────
-#  ENGINE — ARM64 (ELF & Mach-O). Dependency-free.
-#  ADRP+ADD reference finding + prologue walk-back.
+#  SHARED: choose the verify function from grouped references
 # ─────────────────────────────────────────────
 
-def scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
-    def foff_to_vaddr(fo):
-        return fo - code_foff + code_vaddr
+def select_verify_function(sc_refs, ss_refs, starts, label):
+    """Group refs by enclosing function; keep functions that reference BOTH
+    anchors; return the entry VA of the one whose two anchors sit closest
+    together (the is_client?ssl_client:ssl_server select in
+    session_verify_cert_chain). `starts` may be None (no unwind table) — then a
+    synthetic grouping by proximity is used and the caller must resolve the
+    prologue itself."""
+    if not sc_refs or not ss_refs:
+        print(f"\033[91m[-]\033[0m [{label}] Missing references to one or both anchors")
+        return None, None
 
-    def foff_to_rva(fo):
-        return (fo - code_foff + code_vaddr) - base_vaddr
+    if starts:
+        grouped = defaultdict(lambda: [[], []])
+        for a in sc_refs:
+            f = func_start_before(starts, a)
+            if f is not None:
+                grouped[f][0].append(a)
+        for a in ss_refs:
+            f = func_start_before(starts, a)
+            if f is not None:
+                grouped[f][1].append(a)
+
+        candidates = []
+        for f, (scs, sss) in grouped.items():
+            if scs and sss:
+                gap = min(abs(a - b) for a in scs for b in sss)
+                candidates.append((gap, f, scs, sss))
+        if not candidates:
+            print(f"\033[93m[!]\033[0m [{label}] No single function references both anchors; "
+                  "falling back to nearest-pair prologue search")
+            return None, _nearest_pair(sc_refs, ss_refs)
+        candidates.sort()
+        gap, f, scs, sss = candidates[0]
+        print(f"\033[96m[*]\033[0m [{label}] {len(candidates)} function(s) reference both anchors; "
+              f"selected entry {hex(f)} (anchor gap {hex(gap)})")
+        if len(candidates) > 1:
+            others = ', '.join(hex(c[1]) for c in candidates[1:])
+            print(f"\033[96m[*]\033[0m [{label}] other both-anchor functions (likely helpers): {others}")
+        return f, _nearest_pair(sc_refs, ss_refs)
+
+    # No unwind table: return the nearest pair so caller can walk back a prologue.
+    return None, _nearest_pair(sc_refs, ss_refs)
+
+
+def _nearest_pair(sc_refs, ss_refs):
+    best = None
+    for a in sc_refs:
+        for b in ss_refs:
+            d = abs(a - b)
+            if best is None or d < best[0]:
+                best = (d, min(a, b))
+    return best[1] if best else None
+
+
+# ─────────────────────────────────────────────
+#  ENGINE — ARM64 (ELF & Mach-O). Dependency-free.
+# ─────────────────────────────────────────────
+
+def scan_arm64(data, seg, base_vaddr, ssl_client, ssl_server, starts):
+    code_foff, code_vaddr, code_filesz = seg['code']
+
+    def foff_to_cv(fo):
+        return fo - code_foff + code_vaddr
 
     def find_refs(target_va):
         lo12 = target_va & 0xfff
@@ -487,113 +598,158 @@ def scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client,
                         imm = ((immhi << 2) | immlo) << 12
                         if imm & (1 << 32):
                             imm -= (1 << 33)
-                        pc_va = foff_to_vaddr(fi - 4)
+                        pc_va = foff_to_cv(fi - 4)
                         if (pc_va & ~0xfff) + imm == (target_va & ~0xfff):
-                            refs.append(fi)
+                            refs.append(foff_to_cv(fi))
         return refs
 
-    print(f"\033[96m[*]\033[0m [arm64] Scanning ADRP+ADD refs... (may take a moment)")
-    sc_refs = find_refs(ssl_client[0])
-    ss_refs = find_refs(ssl_server[0])
-    print(f"\033[96m[*]\033[0m ssl_client code refs: {[hex(x) for x in sc_refs]}")
-    print(f"\033[96m[*]\033[0m ssl_server code refs: {[hex(x) for x in ss_refs]}")
+    print("\033[96m[*]\033[0m [arm64] Scanning ADRP+ADD references ...")
+    sc_refs = find_refs(ssl_client)
+    ss_refs = find_refs(ssl_server)
+    print(f"\033[96m[*]\033[0m [arm64] ssl_client refs: {[hex(x) for x in sc_refs]}")
+    print(f"\033[96m[*]\033[0m [arm64] ssl_server refs: {[hex(x) for x in ss_refs]}")
 
-    for a in sc_refs:
-        for b in ss_refs:
-            if abs(a - b) < 0x800:
-                start = min(a, b)
-                for i in range(start, max(code_foff, start - 0x300), -4):
-                    instr = struct.unpack_from('<I', data, i)[0]
-                    # SUB SP,SP,#imm  or  STP X29,X30,[SP,...]
-                    if (instr & 0xff8003ff) == 0xd10003ff or (instr & 0xffe07fff) == 0xa9007bfd:
-                        rva = foff_to_rva(i)
-                        print(f"\033[92m[+]\033[0m [arm64] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
-                        print(f"\033[92m[+]\033[0m First bytes: {data[i:i+16].hex(' ')}")
-                        return rva
+    entry, nearest = select_verify_function(sc_refs, ss_refs, starts, 'arm64')
+    if entry is not None:
+        rva = entry - base_vaddr
+        fo = entry - code_vaddr + code_foff
+        print(f"\033[92m[+]\033[0m [arm64] SSL verify entry (RVA): \033[93m{hex(rva)}\033[0m")
+        print(f"\033[92m[+]\033[0m [arm64] First bytes: {data[fo:fo+16].hex(' ')}")
+        return rva
 
-    print("\033[91m[-] [arm64] Could not find SSL verify function\033[0m")
+    # Fallback (no unwind table, e.g. iOS): walk back to a prologue.
+    if nearest is None:
+        return None
+    start_fo = nearest - code_vaddr + code_foff
+    for i in range(start_fo, max(code_foff, start_fo - 0x400), -4):
+        instr = struct.unpack_from('<I', data, i)[0]
+        is_sub_sp = (instr & 0xff8003ff) == 0xd10003ff              # SUB SP,SP,#imm
+        is_stp_fp = (instr & 0xffe07fff) == 0xa9007bfd              # STP X29,X30,[SP,#imm]
+        if is_sub_sp or is_stp_fp:
+            entry = i
+            # A standard framed prologue is `SUB SP,SP,#N ; STP X29,X30,...`.
+            # If we matched the STP, back up to the SUB SP so we return the
+            # true function entry (fixes the v3 off-by-one-instruction).
+            if is_stp_fp and i - 4 >= code_foff:
+                prev = struct.unpack_from('<I', data, i - 4)[0]
+                if (prev & 0xff8003ff) == 0xd10003ff:
+                    entry = i - 4
+            rva = foff_to_cv(entry) - base_vaddr
+            print(f"\033[92m[+]\033[0m [arm64] SSL verify offset (prologue fallback, RVA): \033[93m{hex(rva)}\033[0m")
+            print(f"\033[92m[+]\033[0m [arm64] First bytes: {data[entry:entry+16].hex(' ')}")
+            return rva
+    print("\033[91m[-]\033[0m [arm64] Could not resolve verify function")
     return None
 
 
 # ─────────────────────────────────────────────
-#  ENGINE — x86_64 (ELF). Needs capstone.
-#  RIP-relative LEA reference finding + function-start detection.
+#  ENGINE — x86_64 (ELF). Byte-scan RIP-relative LEA; needs capstone only for
+#  the optional prologue fallback.
 # ─────────────────────────────────────────────
 
-def scan_x86_64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
+def scan_x86_64(data, seg, base_vaddr, ssl_client, ssl_server, starts):
+    code_foff, code_vaddr, code_filesz = seg['code']
+
+    def find_lea_rip(target_va):
+        """Scan for  REX.W 8D modrm(mod=00,rm=101) disp32  -> lea reg,[rip+disp32]."""
+        hits = []
+        lo = code_foff
+        hi = code_foff + code_filesz - 7
+        i = lo
+        while i < hi:
+            b0 = data[i]
+            # REX with W set: 0x48,0x49,0x4C,0x4D (also plain-ish 0x4A/0x4B rare, include W-set only)
+            if b0 in (0x48, 0x49, 0x4C, 0x4D) and data[i + 1] == 0x8D:
+                modrm = data[i + 2]
+                if (modrm & 0xC7) == 0x05:      # mod=00, rm=101 -> RIP-relative
+                    disp = struct.unpack_from('<i', data, i + 3)[0]
+                    insn_va = foff_to_cv(i)
+                    if insn_va + 7 + disp == target_va:
+                        hits.append(insn_va)
+            i += 1
+        return hits
+
+    def foff_to_cv(fo):
+        return fo - code_foff + code_vaddr
+
+    print("\033[96m[*]\033[0m [x86_64] Scanning RIP-relative LEA references ...")
+    sc_refs = find_lea_rip(ssl_client)
+    ss_refs = find_lea_rip(ssl_server)
+    print(f"\033[96m[*]\033[0m [x86_64] ssl_client refs: {[hex(x) for x in sc_refs]}")
+    print(f"\033[96m[*]\033[0m [x86_64] ssl_server refs: {[hex(x) for x in ss_refs]}")
+
+    entry, nearest = select_verify_function(sc_refs, ss_refs, starts, 'x86_64')
+    if entry is not None:
+        rva = entry - base_vaddr
+        fo = entry - code_vaddr + code_foff
+        print(f"\033[92m[+]\033[0m [x86_64] SSL verify entry (RVA): \033[93m{hex(rva)}\033[0m")
+        print(f"\033[92m[+]\033[0m [x86_64] First bytes: {data[fo:fo+16].hex(' ')}")
+        return rva
+
+    # Fallback (no unwind table): find the enclosing function start by locating
+    # the inter-function padding gap that precedes it. Clang aligns functions
+    # and fills the gap with 0xCC (int3) or multi-byte NOPs, so the function
+    # begins at the first byte after the last padding run before `nearest`.
+    if nearest is None:
+        return None
+    ref_fo = nearest - code_vaddr + code_foff
+    lo = max(code_foff, ref_fo - 0x800)
+
+    def is_pad(i):
+        b = data[i]
+        if b == 0xCC:                       # int3 padding
+            return True
+        if b == 0x90:                       # nop
+            return True
+        if b == 0x66 and data[i+1:i+2] == b'\x90':   # 66 90
+            return True
+        if data[i:i+2] == b'\x0f\x1f':      # multi-byte nop
+            return True
+        return False
+
+    # Prefer the nearest real prologue (a push of a callee-saved reg, or
+    # endbr64) at/before the ref; fall back to the padding-gap boundary.
+    entry_fo = None
     cs = _load_capstone()
-    if cs is None:
-        return None
-    from capstone.x86 import X86_OP_MEM
+    if cs is not None:
+        md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+        cand = None
+        for insn in md.disasm(data[lo:ref_fo + 1], foff_to_cv(lo)):
+            if insn.mnemonic == 'endbr64' or \
+               (insn.mnemonic == 'push' and insn.op_str in ('rbp', 'rbx', 'r12', 'r13', 'r14', 'r15')):
+                # start of a prologue = a push not immediately preceded by another push
+                cand = insn.address
+        # walk that candidate up to the first push of its push-cluster
+        if cand is not None:
+            cfo = cand - code_vaddr + code_foff
+            # step backwards over contiguous single-byte/2-byte pushes
+            while cfo - 1 >= lo:
+                b = data[cfo - 1]
+                if b in (0x55, 0x53):                     # push rbp / rbx
+                    cfo -= 1
+                elif data[cfo - 2:cfo] in (b'\x41\x54', b'\x41\x55', b'\x41\x56', b'\x41\x57'):
+                    cfo -= 2                               # push r12..r15
+                else:
+                    break
+            entry_fo = cfo
 
-    md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
-    md.detail = True
+    if entry_fo is None:
+        i = ref_fo - 1
+        while i > lo:
+            if is_pad(i):
+                j = i
+                while j >= lo and is_pad(j):
+                    j -= 1
+                entry_fo = j + 1
+                break
+            i -= 1
 
-    code = data[code_foff:code_foff + code_filesz]
-
-    print(f"\033[96m[*]\033[0m [x86_64] Linear disassembly of code segment...")
-    insns = []                    # ordered (addr, size, mnemonic, op_str)
-    addr_index = {}
-    for insn in md.disasm(code, code_vaddr):
-        addr_index[insn.address] = len(insns)
-        insns.append(insn)
-    if not insns:
-        print("\033[91m[-] [x86_64] Disassembly produced no instructions\033[0m")
-        return None
-
-    sc_va = ssl_client[0]
-    ss_va = ssl_server[0]
-
-    def lea_refs(target_va):
-        refs = []
-        for insn in insns:
-            if insn.mnemonic != 'lea':
-                continue
-            for op in insn.operands:
-                if op.type == X86_OP_MEM and op.mem.base and \
-                   insn.reg_name(op.mem.base) == 'rip' and op.mem.index == 0:
-                    if insn.address + insn.size + op.mem.disp == target_va:
-                        refs.append(insn.address)
-        return refs
-
-    sc_refs = lea_refs(sc_va)
-    ss_refs = lea_refs(ss_va)
-    print(f"\033[96m[*]\033[0m ssl_client LEA refs: {[hex(x) for x in sc_refs]}")
-    print(f"\033[96m[*]\033[0m ssl_server LEA refs: {[hex(x) for x in ss_refs]}")
-
-    if not sc_refs or not ss_refs:
-        print("\033[91m[-] [x86_64] Missing RIP-relative refs to one/both anchors\033[0m")
-        return None
-
-    # Function-start candidates: endbr64, or the instruction right after a
-    # control-flow break (ret/jmp/int3), or the very first instruction.
-    BREAKERS = {'ret', 'jmp', 'int3', 'ud2'}
-    candidates = set()
-    for i, insn in enumerate(insns):
-        if i == 0 or insn.mnemonic == 'endbr64':
-            candidates.add(insn.address)
-        elif i > 0 and insns[i-1].mnemonic in BREAKERS:
-            candidates.add(insn.address)
-    sorted_c = sorted(candidates)
-
-    def func_start_before(va):
-        import bisect
-        idx = bisect.bisect_right(sorted_c, va) - 1
-        return sorted_c[idx] if idx >= 0 else None
-
-    # Pair refs that sit in the same function (window generous for x86 funcs)
-    for a in sc_refs:
-        for b in ss_refs:
-            if abs(a - b) < 0x1200:
-                fs = func_start_before(min(a, b))
-                if fs is not None:
-                    rva = fs - base_vaddr
-                    fo = fs - code_vaddr + code_foff
-                    print(f"\033[92m[+]\033[0m [x86_64] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
-                    print(f"\033[92m[+]\033[0m First bytes: {data[fo:fo+16].hex(' ')}")
-                    return rva
-
-    print("\033[91m[-] [x86_64] Could not resolve enclosing function\033[0m")
+    if entry_fo is not None:
+        rva = foff_to_cv(entry_fo) - base_vaddr
+        print(f"\033[92m[+]\033[0m [x86_64] SSL verify offset (prologue fallback, RVA): \033[93m{hex(rva)}\033[0m")
+        print(f"\033[92m[+]\033[0m [x86_64] First bytes: {data[entry_fo:entry_fo+16].hex(' ')}")
+        return rva
+    print("\033[91m[-]\033[0m [x86_64] Could not resolve verify function")
     return None
 
 
@@ -603,123 +759,123 @@ def scan_x86_64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client
 #  Flutter ARM32 is compiled as Thumb-2.
 # ─────────────────────────────────────────────
 
-def scan_arm32(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server):
+def scan_arm32(data, seg, base_vaddr, ssl_client, ssl_server, starts):
     cs = _load_capstone()
     if cs is None:
         return None
-    from capstone.arm import ARM_OP_REG, ARM_OP_IMM, ARM_REG_PC
+
+    code_foff, code_vaddr, code_filesz = seg['code']
+    startset = set(starts) if starts else set()
+
+    def foff_to_cv(fo):
+        return fo - code_foff + code_vaddr
 
     def align4(x):
         return x & ~3
 
-    def run(mode_thumb):
-        mode = cs.CS_MODE_THUMB if mode_thumb else cs.CS_MODE_ARM
-        md = cs.Cs(cs.CS_ARCH_ARM, mode)
-        md.detail = True
-        code = data[code_foff:code_foff + code_filesz]
+    md = cs.Cs(cs.CS_ARCH_ARM, cs.CS_MODE_THUMB)   # disasm_lite -> low memory
 
-        insns = []
-        for insn in md.disasm(code, code_vaddr):
-            insns.append(insn)
-        return insns
+    ldrpc_re = re.compile(r'^(\w+), \[pc, #(?:0x)?([0-9a-fA-F]+)\]$')
+    imm_re   = re.compile(r'^(\w+), #(?:0x)?([0-9a-fA-F]+)$')
 
-    # Flutter ARM32 engine is Thumb-2; try Thumb first, fall back to ARM.
-    insns = run(True)
-    label = 'thumb'
-    if len(insns) < (code_filesz // 8):     # suspiciously sparse -> try ARM
-        alt = run(False)
-        if len(alt) > len(insns):
-            insns, label = alt, 'arm'
-    print(f"\033[96m[*]\033[0m [armeabi-v7a] Disassembled {len(insns)} insns ({label} mode)")
+    # reg -> ('lit', signed_word) | ('movwt', value)
+    regs = {}
+    sc_refs, ss_refs = [], []
 
-    sc_va = ssl_client[0]
-    ss_va = ssl_server[0]
+    print("\033[96m[*]\033[0m [armeabi-v7a] Streaming Thumb-2 disassembly (resync on data) ...")
+    pos = code_vaddr
+    end = code_vaddr + code_filesz
+    guard = 0
+    while pos < end:
+        progressed = False
+        start_fo = pos - code_vaddr + code_foff
+        for (addr, size, mnem, ops) in md.disasm_lite(data[start_fo:end - code_vaddr + code_foff], pos):
+            progressed = True
+            if addr in startset:
+                regs = {}
+            if mnem in ('ldr', 'ldr.w'):
+                m = ldrpc_re.match(ops)
+                if m:
+                    pool = align4(addr + 4) + int(m.group(2), 16)
+                    fo = pool - code_vaddr + code_foff
+                    if 0 <= fo <= len(data) - 4:
+                        regs[m.group(1)] = ('lit', struct.unpack_from('<i', data, fo)[0])
+                    else:
+                        regs.pop(m.group(1), None)
+                else:
+                    regs.pop(ops.split(',')[0].strip(), None)
+            elif mnem == 'movw':
+                m = imm_re.match(ops)
+                if m:
+                    regs[m.group(1)] = ('movwt', int(m.group(2), 16) & 0xffff)
+            elif mnem == 'movt':
+                m = imm_re.match(ops)
+                if m:
+                    r = m.group(1)
+                    cur = regs.get(r)
+                    base = cur[1] if (cur and cur[0] == 'movwt') else 0
+                    regs[r] = ('movwt', (base & 0xffff) | ((int(m.group(2), 16) & 0xffff) << 16))
+            elif mnem in ('add', 'add.w'):
+                parts = [p.strip() for p in ops.split(',')]
+                if parts and parts[-1] == 'pc':
+                    rd = parts[0]
+                    cur = regs.get(rd)
+                    if cur:
+                        # Thumb ADD Rd,pc : PC = addr + 4 (NOT word-aligned)
+                        tgt = (addr + 4 + cur[1]) & 0xffffffff
+                        if tgt == ssl_client:
+                            sc_refs.append(addr)
+                        elif tgt == ssl_server:
+                            ss_refs.append(addr)
+                    regs.pop(rd, None)
+            pos = addr + size
+        if not progressed:
+            pos += 2      # undecodable halfword -> resync
+        else:
+            pos += 2      # generator hit embedded data -> nudge past it
+        guard += 1
+        if guard > code_filesz:   # safety valve
+            break
 
-    # --- Pass 1: MOVW/MOVT + ADD Rd,PC (PIC address computation) ---
-    def movw_movt_refs():
-        sc, ss = [], []
-        regs = {}
-        for insn in insns:
-            m = insn.mnemonic
-            ops = insn.operands
-            if m == 'movw' and len(ops) == 2 and ops[0].type == ARM_OP_REG and ops[1].type == ARM_OP_IMM:
-                regs[ops[0].reg] = ops[1].imm & 0xffff
-            elif m == 'movt' and len(ops) == 2 and ops[0].type == ARM_OP_REG and ops[1].type == ARM_OP_IMM:
-                r = ops[0].reg
-                regs[r] = (regs.get(r, 0) & 0xffff) | ((ops[1].imm & 0xffff) << 16)
-            elif m == 'add' and len(ops) >= 2 and ops[-1].type == ARM_OP_REG and ops[-1].reg == ARM_REG_PC:
-                rd = ops[0].reg
-                if rd in regs:
-                    pc = align4(insn.address + 4)
-                    tgt = (pc + regs[rd]) & 0xffffffff
-                    if tgt == sc_va:
-                        sc.append(insn.address)
-                    elif tgt == ss_va:
-                        ss.append(insn.address)
-            else:
-                # a plain mov/other write to a reg invalidates stale tracking
-                if ops and ops[0].type == ARM_OP_REG and m in ('mov', 'ldr', 'sub', 'orr', 'eor'):
-                    regs.pop(ops[0].reg, None)
-        return sc, ss
+    print(f"\033[96m[*]\033[0m [armeabi-v7a] ssl_client refs: {[hex(x) for x in sc_refs]}")
+    print(f"\033[96m[*]\033[0m [armeabi-v7a] ssl_server refs: {[hex(x) for x in ss_refs]}")
 
-    # --- Pass 2: LDR Rd,[pc,#imm] literal pool (best-effort) ---
-    def ldr_literal_refs():
-        sc, ss = [], []
-        for insn in insns:
-            if insn.mnemonic != 'ldr':
-                continue
-            ops = insn.operands
-            # ldr rd, [pc, #imm]
-            if len(ops) == 2 and ops[1].type == cs.arm.ARM_OP_MEM and \
-               ops[1].mem.base == ARM_REG_PC:
-                pool_va = align4(insn.address + 4) + ops[1].mem.disp
-                pool_fo = pool_va - code_vaddr + code_foff
-                if 0 <= pool_fo <= len(data) - 4:
-                    word = struct.unpack_from('<I', data, pool_fo)[0]
-                    if word == sc_va:
-                        sc.append(insn.address)
-                    elif word == ss_va:
-                        ss.append(insn.address)
-        return sc, ss
+    entry, nearest = select_verify_function(sc_refs, ss_refs, starts, 'armeabi-v7a')
+    if entry is not None:
+        rva = entry - base_vaddr
+        fo = entry - code_vaddr + code_foff
+        print(f"\033[92m[+]\033[0m [armeabi-v7a] SSL verify entry (RVA): \033[93m{hex(rva)}\033[0m")
+        print(f"\033[92m[+]\033[0m [armeabi-v7a] First bytes: {data[fo:fo+16].hex(' ')}")
+        # Frida hooks module.base + rva; Interceptor handles the Thumb bit.
+        return rva
 
-    sc_refs, ss_refs = movw_movt_refs()
-    if not (sc_refs and ss_refs):
-        l_sc, l_ss = ldr_literal_refs()
-        sc_refs += l_sc
-        ss_refs += l_ss
-    print(f"\033[96m[*]\033[0m ssl_client refs: {[hex(x) for x in sc_refs]}")
-    print(f"\033[96m[*]\033[0m ssl_server refs: {[hex(x) for x in ss_refs]}")
-
-    if not sc_refs or not ss_refs:
-        print("\033[91m[-] [armeabi-v7a] Missing refs to one/both anchors\033[0m")
+    # Fallback: nearest ref -> walk back to PUSH {...,lr}
+    if nearest is None:
         return None
-
+    
     # Function starts: Thumb prologue PUSH {..., lr}
     push_lr = []
-    for insn in insns:
+    fo_lo = max(code_foff, (nearest - code_vaddr + code_foff) - 0x400)
+    fo_hi = (nearest - code_vaddr + code_foff) + 2
+    for insn in md.disasm(data[fo_lo:fo_hi], foff_to_cv(fo_lo)):
         if insn.mnemonic in ('push', 'push.w') and 'lr' in insn.op_str:
             push_lr.append(insn.address)
-    push_lr.sort()
+    if push_lr:
+        rva = push_lr[-1] - base_vaddr
+        print(f"\033[92m[+]\033[0m [armeabi-v7a] SSL verify offset (prologue fallback, RVA): \033[93m{hex(rva)}\033[0m")
+        return rva
+    print("\033[91m[-]\033[0m [armeabi-v7a] Could not resolve verify function")
+    return None
 
-    def func_start_before(va):
-        import bisect
-        idx = bisect.bisect_right(push_lr, va) - 1
-        return push_lr[idx] if idx >= 0 else None
 
-    for a in sc_refs:
-        for b in ss_refs:
-            if abs(a - b) < 0x800:
-                fs = func_start_before(min(a, b))
-                if fs is not None:
-                    rva = fs - base_vaddr
-                    fo = fs - code_vaddr + code_foff
-                    print(f"\033[92m[+]\033[0m [armeabi-v7a] SSL verify offset (RVA): \033[93m{hex(rva)}\033[0m")
-                    print(f"\033[92m[+]\033[0m First bytes: {data[fo:fo+16].hex(' ')}")
-                    # Thumb functions are odd-addressed when branched to; the
-                    # module-base + rva Frida hook works with the even address.
-                    return rva
+# ─────────────────────────────────────────────
+#  ENGINE — x86 (ELF32). Same PIC idea as ARM32 but via the GOT/thunk; rare.
+# ─────────────────────────────────────────────
 
-    print("\033[91m[-] [armeabi-v7a] Could not resolve enclosing function\033[0m")
+def scan_x86_32(data, seg, base_vaddr, ssl_client, ssl_server, starts):
+    print("\033[93m[!]\033[0m x86 (32-bit) uses call-thunk PIC (__x86.get_pc_thunk); static "
+         "resolution is unreliable. Prefer x86_64, or hook dynamically with "
+         "objection/frida. Skipping static analysis.")
     return None
 
 
@@ -732,29 +888,22 @@ def find_offset(binary_path, platform, arch=None):
     with open(binary_path, 'rb') as f:
         data = f.read()
 
-    # Find string anchors (architecture-independent)
-    ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
-    ssl_server = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
-
-    if not ssl_client or not ssl_server:
-        print("\033[91m[-] ssl_client/ssl_server strings not found — may not be a Flutter binary\033[0m")
-        return None
-
-    print(f"\033[92m[+]\033[0m ssl_client @ {[hex(x) for x in ssl_client]}")
-    print(f"\033[92m[+]\033[0m ssl_server @ {[hex(x) for x in ssl_server]}")
-
     # ---- iOS: always arm64 Mach-O ----
     if platform == 'ios':
-        base_vaddr, code_foff, code_vaddr, code_filesz, data = parse_macho_segments(data)
-        ssl_client = [m.start() for m in re.finditer(b'ssl_client\x00', data)]
-        ssl_server = [m.start() for m in re.finditer(b'ssl_server\x00', data)]
-        if not ssl_client or not ssl_server:
-            print("\033[91m[-] ssl_client/ssl_server strings not found in arm64 slice\033[0m")
+        seg, data = parse_macho_segments(data)
+        if seg is None:
+            print("\033[91m[-]\033[0m No executable Mach-O segment found")
             return None
-        if code_foff is None:
-            print("\033[91m[-] No executable segment found\033[0m")
+        loads = seg['loads']
+        base_vaddr = next((va for (off, va, sz) in loads if off == 0), 0)
+        sc = [foff_to_vaddr(loads, m.start()) for m in re.finditer(b'ssl_client\x00', data)]
+        ss = [foff_to_vaddr(loads, m.start()) for m in re.finditer(b'ssl_server\x00', data)]
+        if not sc or not ss:
+            print("\033[91m[-]\033[0m ssl_client/ssl_server strings not found in arm64 slice")
             return None
-        return scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+        print(f"\033[92m[+]\033[0m ssl_client @ {[hex(x) for x in sc]}")
+        print(f"\033[92m[+]\033[0m ssl_server @ {[hex(x) for x in ss]}")
+        return scan_arm64(data, seg, base_vaddr, sc[0], ss[0], None)
 
     # ---- Android: detect arch from the ELF header itself ----
     bin_arch = detect_binary_arch(data)
@@ -764,39 +913,65 @@ def find_offset(binary_path, platform, arch=None):
     print(f"\033[96m[*]\033[0m Binary arch (from ELF header): \033[93m{bin_arch}\033[0m")
 
     if bin_arch in ('arm64', 'x86_64'):
-        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf64_segments(data)
-    else:  # arm (v7a) / x86 -> ELF32
-        base_vaddr, code_foff, code_vaddr, code_filesz = parse_elf32_segments(data)
-
-    if code_foff is None:
-        print("\033[91m[-] No executable segment found\033[0m")
+        seg = parse_elf64_segments(data)
+    else:
+        seg = parse_elf32_segments(data)
+    if seg is None:
+        print("\033[91m[-]\033[0m No executable segment found")
         return None
+
+    loads = seg['loads']
+    base_vaddr = next((va for (off, va, sz) in loads if off == 0), 0)
+
+    sc = [foff_to_vaddr(loads, m.start()) for m in re.finditer(b'ssl_client\x00', data)]
+    ss = [foff_to_vaddr(loads, m.start()) for m in re.finditer(b'ssl_server\x00', data)]
+    if not sc or not ss:
+        print("\033[91m[-]\033[0m ssl_client/ssl_server strings not found — may not be a Flutter binary")
+        return None
+    print(f"\033[92m[+]\033[0m ssl_client @ {[hex(x) for x in sc]}")
+    print(f"\033[92m[+]\033[0m ssl_server @ {[hex(x) for x in ss]}")
+
+    code_foff, code_vaddr, code_filesz = seg['code']
+
+    # Build exact function-start table from unwind info when present.
+    starts = None
+    if bin_arch in ('arm64', 'x86_64') and seg.get('eh_frame_hdr'):
+        ho, hv, hs = seg['eh_frame_hdr']
+        try:
+            starts = eh_frame_function_starts(data, ho, hv)
+            print(f"\033[92m[+]\033[0m Parsed .eh_frame_hdr: {len(starts)} function starts")
+        except Exception as e:
+            print(f"\033[93m[!]\033[0m .eh_frame_hdr parse failed ({e}); using prologue fallback")
+            starts = None
+    elif bin_arch == 'arm' and seg.get('arm_exidx'):
+        eo, ev, es = seg['arm_exidx']
+        starts = arm_exidx_function_starts(data, eo, ev, es,
+                                           code_vaddr, code_vaddr + code_filesz)
+        print(f"\033[92m[+]\033[0m Parsed .ARM.exidx: {len(starts)} function starts")
 
     if bin_arch == 'arm64':
-        return scan_arm64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+        return scan_arm64(data, seg, base_vaddr, sc[0], ss[0], starts)
     elif bin_arch == 'x86_64':
-        return scan_x86_64(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
+        return scan_x86_64(data, seg, base_vaddr, sc[0], ss[0], starts)
     elif bin_arch == 'arm':
-        return scan_arm32(data, base_vaddr, code_foff, code_vaddr, code_filesz, ssl_client, ssl_server)
-    else:  # x86 (32-bit) — rare (old emulator images)
-        print("\033[93m[!] x86 (32-bit) has no PC-relative addressing; static "
-              "resolution is unreliable. Prefer x86_64 or run objection/frida "
-              "dynamically. Skipping.\033[0m")
-        return None
+        return scan_arm32(data, seg, base_vaddr, sc[0], ss[0], starts)
+    else:  # x86 (32-bit)
+        return scan_x86_32(data, seg, base_vaddr, sc[0], ss[0], starts)
 
 
 # ─────────────────────────────────────────────
 #  FRIDA SCRIPT GENERATOR
 # ─────────────────────────────────────────────
 
-def write_frida_script(offset, package, platform, out_path):
+def write_frida_script(offset, package, platform, out_path, arch=None):
     # Module name is libflutter.so on ALL Android ABIs; Flutter on iOS.
     module_name = 'libflutter.so' if platform == 'android' else 'Flutter'
+    arch_note = f" ({arch})" if arch else ""
 
     script = f"""// ================================================
 // K!ll Fl!utter - Auto-generated Frida Script
 // By: f3rb
-// Platform : {platform.upper()}
+// Platform : {platform.upper()}{arch_note}
 // Package  : {package}
 // Offset   : {hex(offset)}
 // Module   : {module_name}
@@ -913,6 +1088,23 @@ def print_summary(package, offset, script_path, proxy, platform, arch=None):
 
 
 # ─────────────────────────────────────────────
+#  ONE ABI END-TO-END
+# ─────────────────────────────────────────────
+
+def process_android_abi(apk_path, out_dir, arch, package, platform, proxy):
+    binary_path, real_arch = extract_flutter_android(apk_path, out_dir, arch)
+    if not binary_path:
+        return None
+    offset = find_offset(binary_path, platform, real_arch)
+    if offset is None:
+        print(f"\033[91m[-]\033[0m [{real_arch}] Offset not found")
+        return None
+    script_path = os.path.join(out_dir, f'flutter_bypass_{real_arch}.js')
+    write_frida_script(offset, package, platform, script_path, real_arch)
+    return (real_arch, offset, script_path)
+
+
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
@@ -973,46 +1165,36 @@ def main():
     print(f"\033[96m[*]\033[0m Output   : {out_dir}")
     print(f"\033[96m[*]\033[0m Proxy    : {proxy}")
 
-    # Step 1: Get identifier
+    # Identifier
     if platform == 'android':
-        package = get_package_name_android(app_path)
-        if package:
-            print(f"\033[92m[+]\033[0m Package: \033[93m{package}\033[0m")
-        else:
-            package = input("\033[93m[?] Enter package name manually: \033[0m").strip()
+        package = get_package_name_android(app_path) \
+            or input("\033[93m[?] Enter package name manually: \033[0m").strip()
+        print(f"\033[92m[+]\033[0m Package: \033[93m{package}\033[0m")
     else:
-        package = get_bundle_id_ios(app_path)
-        if package:
-            print(f"\033[92m[+]\033[0m Bundle ID: \033[93m{package}\033[0m")
-        else:
-            package = input("\033[93m[?] Enter bundle ID manually (e.g. com.example.app): \033[0m").strip()
+        package = get_bundle_id_ios(app_path) \
+            or input("\033[93m[?] Enter bundle ID manually (e.g. com.example.app): \033[0m").strip()
+        print(f"\033[92m[+]\033[0m Bundle ID: \033[93m{package}\033[0m")
 
-    # Step 2: Extract Flutter binary
-    arch = None
+    # ---- Single ABI / iOS ----
     if platform == 'android':
-        binary_path, arch = extract_flutter_android(app_path, out_dir, args.arch)
+        r = process_android_abi(app_path, out_dir, args.arch, package, platform, proxy)
+        if not r:
+            sys.exit(1)
+        arch, offset, script_path = r
+        print_commands_android(package, proxy, script_path)
+        print_summary(package, offset, script_path, proxy, platform, arch)
     else:
         binary_path = extract_flutter_ios(app_path, out_dir)
-
-    if not binary_path:
-        sys.exit(1)
-
-    # Step 3: Find SSL offset
-    offset = find_offset(binary_path, platform, arch)
-    if offset is None:
-        sys.exit(1)
-
-    # Step 4: Write Frida script
-    script_path = os.path.join(out_dir, 'flutter_bypass.js')
-    write_frida_script(offset, package, platform, script_path)
-
-    # Step 5: Print commands
-    if platform == 'android':
-        print_commands_android(package, proxy, script_path)
-    else:
+        if not binary_path:
+            sys.exit(1)
+        offset = find_offset(binary_path, platform)
+        if offset is None:
+            sys.exit(1)
+        script_path = os.path.join(out_dir, 'flutter_bypass.js')
+        write_frida_script(offset, package, platform, script_path)
         print_commands_ios(package, proxy, script_path, device_ip)
 
-    print_summary(package, offset, script_path, proxy, platform, arch)
+    print_summary(package, offset, script_path, proxy, platform)
 
 
 if __name__ == '__main__':
